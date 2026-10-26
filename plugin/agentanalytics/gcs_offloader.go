@@ -364,6 +364,9 @@ func (b *BatchProcessor) resolveUploads(ctx context.Context, pauseOnCallerDeadli
 	var completedNormally bool
 	defer func() {
 		if !completedNormally {
+			for _, row := range batch {
+				delete(row, deferredUploadsKey)
+			}
 			b.releaseUploadBytes(reservedTotal)
 		} else {
 			b.releaseUploadBytes(reservedTotal - deferredReserved)

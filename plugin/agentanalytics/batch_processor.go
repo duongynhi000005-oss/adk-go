@@ -476,6 +476,13 @@ func (b *BatchProcessor) flushRunEnd() {
 	// flushCtx always has a deadline: it is made by WithTimeout.
 	flushDeadline, _ := flushCtx.Deadline()
 
+	var activeBatch []map[string]any
+	defer func() {
+		for _, row := range activeBatch {
+			b.releaseRowUploads(row)
+		}
+	}()
+
 	firstUploadBatch := true
 	for !b.closed.Load() && b.hasPendingWorkLocked() && flushCtx.Err() == nil {
 		retry := len(b.deferredBatch) > 0
@@ -483,11 +490,13 @@ func (b *BatchProcessor) flushRunEnd() {
 		if len(batch) == 0 {
 			break
 		}
+		activeBatch = batch
 		if b.streamWriter.isRotationInCooldown() {
 			b.recordAppendFailureDrop(int64(len(batch)))
 			for _, row := range batch {
 				b.releaseRowUploads(row)
 			}
+			activeBatch = nil
 			b.config.logf("ERROR: Failed to write batch to BigQuery: committed write stream rotation in cooldown")
 			continue
 		}
@@ -508,15 +517,19 @@ func (b *BatchProcessor) flushRunEnd() {
 			if flushCtx.Err() != nil && !retry {
 				b.requeueDeferredUploads(batch)
 				b.deferredBatch = batch
+				activeBatch = nil
 				return
 			}
 			b.recordAppendFailureDrop(int64(len(batch)))
 			for _, row := range batch {
 				b.releaseRowUploads(row)
 			}
+			activeBatch = nil
 			b.config.logf("ERROR: Failed to write batch to BigQuery: %v", err)
+			continue
 		}
 		b.clearDeferredUploads(batch)
+		activeBatch = nil
 	}
 }
 
@@ -541,6 +554,19 @@ func (b *BatchProcessor) flushAndWaitForInflightBatch() time.Duration {
 	b.flushMu.Lock()
 	defer b.flushMu.Unlock()
 
+	var (
+		activeBatch  []map[string]any
+		cancelActive context.CancelFunc
+	)
+	defer func() {
+		if cancelActive != nil {
+			cancelActive()
+		}
+		for _, row := range activeBatch {
+			b.releaseRowUploads(row)
+		}
+	}()
+
 	writeLeft := b.shutdownTimeout()
 	uploadLeft := writeLeft / 2
 	for b.hasPendingWorkLocked() {
@@ -548,7 +574,12 @@ func (b *BatchProcessor) flushAndWaitForInflightBatch() time.Duration {
 		if len(batch) == 0 {
 			break
 		}
+		activeBatch = batch
 		if writeLeft <= 0 || b.streamWriter.isRotationInCooldown() {
+			for _, row := range batch {
+				b.releaseRowUploads(row)
+			}
+			activeBatch = nil
 			if writeLeft <= 0 {
 				b.recordShutdownDrop(int64(len(batch)))
 				b.config.logf("WARNING: Failed to write batch of %d events: %v", len(batch), context.DeadlineExceeded)
@@ -556,26 +587,28 @@ func (b *BatchProcessor) flushAndWaitForInflightBatch() time.Duration {
 				b.recordAppendFailureDrop(int64(len(batch)))
 				b.config.logf("WARNING: Failed to write batch of %d events: committed write stream rotation in cooldown", len(batch))
 			}
-			for _, row := range batch {
-				b.releaseRowUploads(row)
-			}
 			continue
 		}
 
 		// A context whose time is up ends the uploads at once.
 		start := time.Now()
 		uploadCtx, cancelUploads := context.WithTimeout(b.baseCtx, uploadLeft)
+		cancelActive = cancelUploads
 		b.resolveUploads(uploadCtx, false, batch)
 		cancelUploads()
+		cancelActive = nil
 		uploadLeft -= time.Since(start)
 
 		start = time.Now()
 		writeCtx, cancelWrite := context.WithTimeout(b.baseCtx, writeLeft)
+		cancelActive = cancelWrite
 		err := b.appendBatch(writeCtx, batch)
 		writeExpired := writeCtx.Err() != nil
 		cancelWrite()
+		cancelActive = nil
 		writeLeft -= time.Since(start)
 		b.clearDeferredUploads(batch)
+		activeBatch = nil
 		if writeExpired && writeLeft > 0 {
 			writeLeft = 0
 		}
@@ -603,16 +636,20 @@ func (b *BatchProcessor) writeBatchWithContexts(uploadCtx, writeCtx context.Cont
 		}
 		return fmt.Errorf("committed write stream rotation in cooldown")
 	}
+	defer func() {
+		for _, row := range batch {
+			b.releaseRowUploads(row)
+		}
+	}()
 	b.resolveUploads(uploadCtx, pauseOnCallerDeadline, batch)
-	err := b.appendBatch(writeCtx, batch)
-	b.clearDeferredUploads(batch)
-	return err
+	return b.appendBatch(writeCtx, batch)
 }
 
 // appendBatch appends batch, whose uploads are resolved, to BigQuery under
 // writeCtx, and counts the batch in DropStats if the append fails. A writeCtx
 // without a deadline gets one of ShutdownTimeout.
 func (b *BatchProcessor) appendBatch(writeCtx context.Context, batch []map[string]any) error {
+	defer b.clearDeferredUploads(batch)
 	err := b.tryAppendBatch(writeCtx, batch)
 	if err != nil {
 		b.recordAppendFailureDrop(int64(len(batch)))

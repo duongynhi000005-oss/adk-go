@@ -3950,3 +3950,129 @@ func TestResolveUploads_PanickingLoggerReleasesDeferredReservation(t *testing.T)
 		t.Errorf("pendingUploadBytes = %d, want 0", got)
 	}
 }
+
+type panicOnBQResponseLogger struct{}
+
+func (panicOnBQResponseLogger) Printf(format string, _ ...any) {
+	if strings.Contains(format, "BigQuery response") {
+		panic("logger boom on BigQuery response")
+	}
+}
+func (panicOnBQResponseLogger) Println(...any) {}
+
+func TestFlushRunEnd_PanickingLoggerOnBigQueryResponseReleasesDeferredReservation(t *testing.T) {
+	var (
+		stalled   atomic.Bool
+		callCount atomic.Int32
+	)
+	stalled.Store(true)
+	off := &fakeOffloader{hook: func(ctx context.Context, _ GCSUploadRequest) error {
+		if stalled.Load() {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	}}
+
+	srv := &scriptedCommittedStreamServer{
+		onAppend: func(_ int, _ *storagepb.AppendRowsRequest) (*storagepb.AppendRowsResponse, error) {
+			switch callCount.Add(1) {
+			case 1:
+				// Batch 0: consume > 1/4 of ShutdownTimeout so Batch 1 runs with a
+				// depleted caller deadline (pauseOnCallerDeadline == false).
+				time.Sleep(40 * time.Millisecond)
+				return &storagepb.AppendRowsResponse{}, nil
+			case 2:
+				// Batch 1: return row errors so tryAppendBatch logs "BigQuery response: ...".
+				return &storagepb.AppendRowsResponse{
+					RowErrors: []*storagepb.RowError{{Index: 0, Message: "bad row"}},
+				}, nil
+			default:
+				return &storagepb.AppendRowsResponse{}, nil
+			}
+		},
+	}
+	lis, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	gSrv := grpc.NewServer()
+	storagepb.RegisterBigQueryWriteServer(gSrv, srv)
+	go func() { _ = gSrv.Serve(lis) }()
+	t.Cleanup(gSrv.Stop)
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	writeClient, err := bqstorage.NewBigQueryWriteClient(context.Background(), option.WithGRPCConn(conn))
+	if err != nil {
+		t.Fatalf("write client: %v", err)
+	}
+	t.Cleanup(func() { _ = writeClient.Close() })
+
+	cfg := DefaultConfig()
+	cfg.BatchSize = 1
+	cfg.BatchFlushIntv = time.Hour
+	cfg.ShutdownTimeout = 120 * time.Millisecond
+	cfg.RetryConfig.MaxRetries = 0
+	cfg.GCSOffloader = off
+	cfg.GCSMaxPendingUploadBytes = 128
+	cfg.Logger = panicOnBQResponseLogger{}
+
+	bp, err := NewBatchProcessor(context.Background(), writeClient, "projects/p/datasets/d/tables/t/_default", cfg)
+	if err != nil {
+		t.Fatalf("NewBatchProcessor: %v", err)
+	}
+	t.Cleanup(bp.Close)
+
+	opts := partsOptions{maxLen: 1000, offload: true, inlineLimit: 10, reserveBytes: bp.tryReserveUploadBytes}
+
+	// Batch 0: no upload; depletes > 1/4 of ShutdownTimeout.
+	bp.queue <- map[string]any{"event_type": EventUserMessageReceived}
+
+	// Batch 1: 64-byte upload deferred when its upload deadline expires, then
+	// tryAppendBatch panics in Logger.Printf("BigQuery response: ...") on row errors.
+	row1 := queuedRow(opts, imageContent(make([]byte, 64)...))
+	row1["event_type"] = EventLLMRequest
+	bp.queue <- row1
+
+	// Batch 2: 64-byte upload that stays in bp.queue when Batch 1 panics.
+	row2 := queuedRow(opts, imageContent(make([]byte, 64)...))
+	row2["event_type"] = EventLLMRequest
+	bp.queue <- row2
+
+	if got := bp.pendingUploadBytes.Load(); got != 128 {
+		t.Fatalf("pendingUploadBytes before flushRunEnd = %d, want 128", got)
+	}
+
+	panicked := false
+	func() {
+		defer func() {
+			if recover() != nil {
+				panicked = true
+			}
+		}()
+		bp.flushRunEnd()
+	}()
+	if !panicked {
+		t.Fatal("flushRunEnd did not panic on BigQuery response log")
+	}
+
+	// Batch 1 is gone; only Batch 2 remains in bp.queue, so pendingUploadBytes
+	// must equal Batch 2's 64-byte reservation rather than stranding Batch 1's 64 bytes.
+	if got := bp.pendingUploadBytes.Load(); got != 64 {
+		t.Fatalf("pendingUploadBytes after Logger panic in flushRunEnd = %d, want 64 (only queued row2)", got)
+	}
+
+	// Drain Batch 2 with healthy storage and verify the full 128-byte budget is available again.
+	stalled.Store(false)
+	bp.flushRunEnd()
+	if got := bp.pendingUploadBytes.Load(); got != 0 {
+		t.Fatalf("pendingUploadBytes after draining remaining queue = %d, want 0", got)
+	}
+	if !bp.tryReserveUploadBytes(128) {
+		t.Fatal("tryReserveUploadBytes(128) failed after drain; deferred upload bytes were leaked")
+	}
+	bp.releaseUploadBytes(128)
+}
